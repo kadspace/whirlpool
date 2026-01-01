@@ -1,0 +1,8 @@
+C:\Users\lycomp\.gemini\antigravity\playground\cosmic-whirlpool\hello_vst\target_vst_build_final\release\deps\unicode_ident-7f7329ca8fe0dfcc.d: C:\Users\lycomp\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\unicode-ident-1.0.22\src\lib.rs C:\Users\lycomp\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\unicode-ident-1.0.22\src\tables.rs
+
+C:\Users\lycomp\.gemini\antigravity\playground\cosmic-whirlpool\hello_vst\target_vst_build_final\release\deps\libunicode_ident-7f7329ca8fe0dfcc.rlib: C:\Users\lycomp\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\unicode-ident-1.0.22\src\lib.rs C:\Users\lycomp\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\unicode-ident-1.0.22\src\tables.rs
+
+C:\Users\lycomp\.gemini\antigravity\playground\cosmic-whirlpool\hello_vst\target_vst_build_final\release\deps\libunicode_ident-7f7329ca8fe0dfcc.rmeta: C:\Users\lycomp\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\unicode-ident-1.0.22\src\lib.rs C:\Users\lycomp\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\unicode-ident-1.0.22\src\tables.rs
+
+C:\Users\lycomp\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\unicode-ident-1.0.22\src\lib.rs:
+C:\Users\lycomp\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\unicode-ident-1.0.22\src\tables.rs:

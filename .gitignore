@@ -1,0 +1,11 @@
+target/
+target_vst_build/
+**/*.vst3
+**/*.dll
+**/*.exe
+**/*.pdb
+**/*.iobj
+**/*.ipdb
+*.log
+*.txt
+.DS_Store
