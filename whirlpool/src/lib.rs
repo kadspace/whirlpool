@@ -1,115 +1,39 @@
 
 use nih_plug::prelude::*;
 use nih_plug_egui::{create_egui_editor, egui, EguiState, widgets};
-use std::sync::Arc;
-use std::f32::consts::PI;
+use std::sync::{Arc, Mutex};
+use rustfft::{FftPlanner, num_complex::Complex};
+use rustfft::num_traits::Zero;
+use std::collections::VecDeque;
 
-// --- DSP COMPONENTS ---
+// --- DSP CONSTANTS ---
+const FFT_SIZE: usize = 1024; // ~23ms at 44.1k
 
-// 1. Simple Reverb (Freeverb-ish)
-struct Reverb {
-    combs: Vec<(Vec<f32>, usize)>, // buffer, write_ptr
-    allpasses: Vec<(Vec<f32>, usize)>,
-    sample_rate: f32,
+struct Visuals {
+    input_history: VecDeque<f32>,
+    output_history: VecDeque<f32>,
 }
 
-impl Reverb {
-    fn new() -> Self {
-        Self { combs: Vec::new(), allpasses: Vec::new(), sample_rate: 44100.0 }
-    }
-
-    fn init(&mut self, sample_rate: f32) {
-        self.sample_rate = sample_rate;
-        // Tuning values from Freeverb
-        let tuning_combs = [1116, 1188, 1277, 1356, 1422, 1491, 1557, 1617];
-        let tuning_ap = [225, 341, 441, 561];
-
-        self.combs = tuning_combs.iter().map(|&len| (vec![0.0; len], 0)).collect();
-        self.allpasses = tuning_ap.iter().map(|&len| (vec![0.0; len], 0)).collect();
-    }
-
-    fn process(&mut self, input: f32, room_size: f32, damp: f32) -> f32 {
-        let mut out = 0.0;
-        let feedback = room_size * 0.28; // Scale 0-1 to reasonable feedback
-        
-        // Parallel Combs
-        for (buffer, ptr) in self.combs.iter_mut() {
-            let output = buffer[*ptr];
-            buffer[*ptr] = input + (output * feedback * (1.0 - damp)); // Simple implementation
-            *ptr = (*ptr + 1) % buffer.len();
-            out += output;
+impl Default for Visuals {
+    fn default() -> Self {
+        Self { 
+            input_history: VecDeque::from(vec![0.0; 512]),
+            output_history: VecDeque::from(vec![0.0; 512]),
         }
-
-        // Series Allpasses
-        for (buffer, ptr) in self.allpasses.iter_mut() {
-            let buf_out = buffer[*ptr];
-            let processed = out - buf_out;
-            buffer[*ptr] = out + (buf_out * 0.5);
-            *ptr = (*ptr + 1) % buffer.len();
-            out = processed;
-        }
-
-        out * 0.015 // Gain compensation
     }
 }
-
-// 2. Simple Delay
-struct StereoDelay {
-    buffer: Vec<f32>,
-    write_ptr: usize,
-    sample_rate: f32,
-}
-
-impl StereoDelay {
-    fn new() -> Self {
-        Self { buffer: vec![0.0; 192000], write_ptr: 0, sample_rate: 44100.0 }
-    }
-
-    fn process(&mut self, left_in: f32, right_in: f32, time_ms: f32, feedback: f32) -> (f32, f32) {
-        let delay_samples = (time_ms / 1000.0 * self.sample_rate).max(1.0);
-        
-        // Read ptr
-        let read_idx_f = self.write_ptr as f32 - delay_samples;
-        let read_idx = if read_idx_f < 0.0 { read_idx_f + self.buffer.len() as f32 } else { read_idx_f };
-        let idx = read_idx as usize; // No lerp for simplicity in this turn, add if grainy
-
-        // Simple mono buffer for stereo delay (ping pong or just dual mono would be better, but sharing buffer for texture)
-        // Let's do simple mono delay logic applied to stereo for "Whirlpool" wash
-        let delayed = self.buffer[idx];
-        
-        // Write
-        let input_mix = (left_in + right_in) * 0.5;
-        self.buffer[self.write_ptr] = input_mix + (delayed * feedback);
-        self.write_ptr = (self.write_ptr + 1) % self.buffer.len();
-
-        (delayed, delayed) // Dual mono return
-    }
-}
-
-// 3. Multi-Band Slam (OTT approximation)
-struct OttBand {
-    ceiling: f32,
-}
-
-impl OttBand {
-    fn process(&mut self, input: f32, depth: f32, drive: f32) -> f32 {
-        // Hard upward/downward compression sim
-        let driven = input * (1.0 + drive * 10.0); // Boost input
-        let compressed = driven.tanh(); // Soft clip / Limit
-        
-        // "Upward" check (boost quiet sounds - simplified by just high gain + limit)
-        // Depth blends between dry and smashed
-        input * (1.0 - depth) + compressed * depth
-    }
-}
-
-// --- PLUGIN ---
 
 struct Whirlpool {
     params: Arc<WhirlpoolParams>,
-    reverb: Reverb,
-    delay: StereoDelay,
-    // Simple localized state for OTT
+    visuals: Arc<Mutex<Visuals>>,
+    
+    // DSP State
+    planner: FftPlanner<f32>,
+    in_buf: Vec<f32>,   // Accumulate input
+    out_buf: VecDeque<f32>, // Latency buffer
+    window: Vec<f32>,
+    scratch_in: Vec<Complex<f32>>,
+    scratch_out: Vec<Complex<f32>>,
 }
 
 #[derive(Params)]
@@ -117,28 +41,27 @@ struct WhirlpoolParams {
     #[persist = "editor-state"]
     editor_state: Arc<EguiState>,
 
-    // Reverb
-    #[id = "rev_mix"] pub rev_mix: FloatParam,
-    #[id = "rev_size"] pub rev_size: FloatParam,
-
-    // Delay
-    #[id = "del_time"] pub del_time: FloatParam,
-    #[id = "del_feed"] pub del_feed: FloatParam,
-    #[id = "del_mix"] pub del_mix: FloatParam,
-
-    // OTT
-    #[id = "ott_depth"] pub ott_depth: FloatParam,
-    #[id = "ott_drive"] pub ott_drive: FloatParam,
-
-    #[id = "output_gain"] pub output_gain: FloatParam,
+    #[id = "harmonics"] pub harmonics: FloatParam,
+    #[id = "shift"] pub shift: FloatParam,
+    #[id = "blur"] pub blur: FloatParam,
+    #[id = "mix"] pub mix: FloatParam,
+    #[id = "output_gain"] pub out_gain: FloatParam,
 }
 
 impl Default for Whirlpool {
     fn default() -> Self {
+        let mut planner = FftPlanner::new();
+        let window = (0..FFT_SIZE).map(|i| 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / (FFT_SIZE as f32 - 1.0)).cos())).collect();
+        
         Self {
             params: Arc::new(WhirlpoolParams::default()),
-            reverb: Reverb::new(),
-            delay: StereoDelay::new(),
+            visuals: Arc::new(Mutex::new(Visuals::default())),
+            planner,
+            in_buf: Vec::with_capacity(FFT_SIZE),
+            out_buf: VecDeque::from(vec![0.0; FFT_SIZE]), // Initial Latency
+            window,
+            scratch_in: vec![Complex::zero(); FFT_SIZE],
+            scratch_out: vec![Complex::zero(); FFT_SIZE],
         }
     }
 }
@@ -146,29 +69,23 @@ impl Default for Whirlpool {
 impl Default for WhirlpoolParams {
     fn default() -> Self {
         Self {
-            editor_state: EguiState::from_size(400, 500),
+            editor_state: EguiState::from_size(500, 350),
 
-            rev_mix: FloatParam::new("Rev Mix", 0.3, FloatRange::Linear { min: 0.0, max: 1.0 }),
-            rev_size: FloatParam::new("Rev Size", 0.8, FloatRange::Linear { min: 0.1, max: 0.99 }),
-
-            del_time: FloatParam::new("Dly Time", 250.0, FloatRange::Linear { min: 10.0, max: 2000.0 }),
-            del_feed: FloatParam::new("Dly Feed", 0.4, FloatRange::Linear { min: 0.0, max: 0.95 }),
-            del_mix: FloatParam::new("Dly Mix", 0.3, FloatRange::Linear { min: 0.0, max: 1.0 }),
-
-            ott_depth: FloatParam::new("OTT Depth", 0.5, FloatRange::Linear { min: 0.0, max: 1.0 }),
-            ott_drive: FloatParam::new("OTT Drive", 0.2, FloatRange::Linear { min: 0.0, max: 1.0 }),
-
-            output_gain: FloatParam::new("Out Gain", 1.0, FloatRange::Linear { min: 0.0, max: 2.0 }),
+            harmonics: FloatParam::new("Harmonics", 0.5, FloatRange::Linear { min: 0.0, max: 1.0 }),
+            shift: FloatParam::new("Shift (Oct)", 1.0, FloatRange::Linear { min: 0.5, max: 3.0 }),
+            blur: FloatParam::new("Blur", 0.2, FloatRange::Linear { min: 0.0, max: 1.0 }),
+            mix: FloatParam::new("Dry/Wet", 0.8, FloatRange::Linear { min: 0.0, max: 1.0 }),
+            out_gain: FloatParam::new("Output", 1.0, FloatRange::Linear { min: 0.0, max: 2.0 }),
         }
     }
 }
 
 impl Plugin for Whirlpool {
-    const NAME: &'static str = "Whirlpool";
+    const NAME: &'static str = "Whirlpool Spectral";
     const VENDOR: &'static str = "Antigravity";
     const URL: &'static str = "https://example.com";
     const EMAIL: &'static str = "info@example.com";
-    const VERSION: &'static str = "1.0.0";
+    const VERSION: &'static str = "2.0.0";
 
     const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[
         AudioIOLayout {
@@ -182,58 +99,66 @@ impl Plugin for Whirlpool {
     type SysExMessage = ();
     type BackgroundTask = ();
 
-    fn params(&self) -> Arc<dyn Params> {
-        self.params.clone()
-    }
-
-    fn initialize(
-        &mut self,
-        _audio_io_layout: &AudioIOLayout,
-        buffer_config: &BufferConfig,
-        _context: &mut impl InitContext<Self>,
-    ) -> bool {
-        self.reverb.init(buffer_config.sample_rate);
-        self.delay.sample_rate = buffer_config.sample_rate;
-        true
-    }
+    fn params(&self) -> Arc<dyn Params> { self.params.clone() }
 
     fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
         let params = self.params.clone();
+        let visuals = self.visuals.clone();
+        
         create_egui_editor(
             self.params.editor_state.clone(),
             (),
             |_, _| {},
             move |ctx: &egui::Context, setter: &ParamSetter, _state: &mut ()| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    ui.heading("WHIRLPOOL");
+                    ui.heading("WHIRLPOOL SPECTRAL");
                     ui.separator();
                     
-                    // Style
-                    ui.style_mut().spacing.item_spacing = egui::vec2(0.0, 10.0);
+                    // --- WAVEFORM VISUALIZER ---
+                    // Draw a dark background
+                    let (rect, _resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 100.0), egui::Sense::hover());
+                    ui.painter().rect_filled(rect, 3.0, egui::Color32::from_rgb(10, 10, 15));
 
-                    ui.push_id("reverb_sect", |ui| {
-                        ui.label(egui::RichText::new("REVERB (Wash)").strong());
-                        ui.add(widgets::ParamSlider::for_param(&params.rev_mix, setter));
-                        ui.add(widgets::ParamSlider::for_param(&params.rev_size, setter));
-                    });
+                    if let Ok(vis) = visuals.try_lock() {
+                        // Safe to read visuals here
+                        // Draw Input (Gray)
+                        if vis.input_history.len() > 1 {
+                             let points_in: Vec<egui::Pos2> = vis.input_history.iter().enumerate().map(|(i, &v)| {
+                                 let x = rect.min.x + (i as f32 / vis.input_history.len() as f32) * rect.width();
+                                 let y = rect.center().y - v * 40.0;
+                                 egui::pos2(x, y)
+                             }).collect();
+                             ui.painter().add(egui::Shape::line(points_in, egui::Stroke::new(1.0, egui::Color32::from_rgb(80, 80, 80))));
+                        }
+
+                        // Draw Output (Cyan)
+                        if vis.output_history.len() > 1 {
+                            let points_out: Vec<egui::Pos2> = vis.output_history.iter().enumerate().map(|(i, &v)| {
+                                let x = rect.min.x + (i as f32 / vis.output_history.len() as f32) * rect.width();
+                                let y = rect.center().y - v * 40.0;
+                                egui::pos2(x, y)
+                            }).collect();
+                            ui.painter().add(egui::Shape::line(points_out, egui::Stroke::new(1.5, egui::Color32::from_rgb(0, 255, 255))));
+                        }
+                        
+                        // Request repaint for animation
+                        ui.ctx().request_repaint();
+                    }
+
                     ui.separator();
 
-                    ui.push_id("delay_sect", |ui| {
-                        ui.label(egui::RichText::new("DELAY (Flow)").strong());
-                        ui.add(widgets::ParamSlider::for_param(&params.del_time, setter));
-                        ui.add(widgets::ParamSlider::for_param(&params.del_feed, setter));
-                        ui.add(widgets::ParamSlider::for_param(&params.del_mix, setter));
-                    });
+                    // --- CONTROLS ---
+                    ui.label("Harmonics");
+                    ui.add(widgets::ParamSlider::for_param(&params.harmonics, setter));
+                    ui.label("Shift");
+                    ui.add(widgets::ParamSlider::for_param(&params.shift, setter));
+                    ui.label("Blur");
+                    ui.add(widgets::ParamSlider::for_param(&params.blur, setter));
                     ui.separator();
-
-                    ui.push_id("ott_sect", |ui| {
-                        ui.label(egui::RichText::new("OTT (Crush)").strong());
-                        ui.add(widgets::ParamSlider::for_param(&params.ott_depth, setter));
-                        ui.add(widgets::ParamSlider::for_param(&params.ott_drive, setter));
-                    });
-                    ui.separator();
-                    
-                    ui.add(widgets::ParamSlider::for_param(&params.output_gain, setter));
+                    ui.label("Dry/Wet");
+                    ui.add(widgets::ParamSlider::for_param(&params.mix, setter));
+                    ui.label("Volume");
+                    ui.add(widgets::ParamSlider::for_param(&params.out_gain, setter));
                 });
             },
         )
@@ -245,76 +170,139 @@ impl Plugin for Whirlpool {
         _aux: &mut AuxiliaryBuffers,
         _context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
-        for channel_samples in buffer.iter_samples() {
-            let rev_mix = self.params.rev_mix.value();
-            let rev_size = self.params.rev_size.value();
-            
-            let del_time = self.params.del_time.value();
-            let del_feed = self.params.del_feed.value();
-            let del_mix = self.params.del_mix.value();
-            
-            let ott_depth = self.params.ott_depth.value();
-            let ott_drive = self.params.ott_drive.value();
-            
-            let out_gain = self.params.output_gain.value();
+        let harmonics = self.params.harmonics.value();
+        let shift = self.params.shift.value();
+        let blur = self.params.blur.value();
+        let mix = self.params.mix.value();
+        let gain = self.params.out_gain.value();
 
-            // Collect samples to mutable references so we can read and write
+        // Mono processing buffer loop
+        for channel_samples in buffer.iter_samples() {
+            // Collect samples to avoid double-borrow issue
             let mut samples: Vec<&mut f32> = channel_samples.into_iter().collect();
+            if samples.is_empty() { continue; }
+
+            // Calculate Mono Input
+            let mut input_mono = 0.0;
+            for s in samples.iter() { input_mono += **s; }
+            input_mono /= samples.len() as f32;
+
+            // STFT Buffering
+            self.in_buf.push(input_mono);
+
+            // Output sample (Latency compensation: pop from out_buf)
+            // If out_buf is empty (underrun or initial), return 0
+            // But we pre-filled it in Default.
+            // If push rate > pop rate? No, 1:1 ratio.
             
-            if samples.len() < 2 {
-                continue; 
+            // PROCESS FRAME if enough input
+            if self.in_buf.len() >= FFT_SIZE {
+                 // 1. Prepare FFT (Copy windowed input to scratch)
+                 for i in 0..FFT_SIZE {
+                     self.scratch_in[i] = Complex::new(self.in_buf[i] * self.window[i], 0.0);
+                 }
+                 
+                 // 2. Forward FFT
+                 self.planner.plan_fft_forward(FFT_SIZE).process(&mut self.scratch_in);
+
+                 // 3. Spectral Processing
+                 // Zero out output scratch
+                 for x in self.scratch_out.iter_mut() { *x = Complex::zero(); }
+                 
+                 let half = FFT_SIZE / 2;
+                 
+                 for i in 0..half {
+                     let bin = self.scratch_in[i];
+                     if bin.norm_sqr() < 1e-6 { continue; } // Noise floor
+
+                     // Fundamental (Mix with Harmonics later via 'mix' param is Dry/Wet?)
+                     // Actually 'harmonics' param adds harmonics. Fundamental is always there?
+                     // Let's say Harmonics param controls the ADDED harmonics level.
+                     self.scratch_out[i] += bin;
+
+                     // Generate Harmonics
+                     if harmonics > 0.01 {
+                         // Shift logic
+                         // e.g. Shift 1.0 = Octave (+100% freq -> 2x freq)
+                         // e.g. Shift 0.5 = Fifth (+50% -> 1.5x)
+                         let target_idx = (i as f32 * (1.0 + shift)).round() as usize; 
+                         
+                         if target_idx < half {
+                             let mag = bin.norm();
+                             let phase = bin.arg();
+                             
+                             // Blur phase
+                             let new_phase = if blur > 0.0 { 
+                                 // Random phase or linear phase shift? Random is nicer for "wash"
+                                 // But we don't have rand here easily (unless we add valid Rng).
+                                 // Deterministic blur: phase + i * blur
+                                 phase + (i as f32 * blur * 0.1)
+                             } else { phase };
+                             
+                             self.scratch_out[target_idx] += Complex::from_polar(mag * harmonics, new_phase);
+                         }
+                     }
+                 }
+                 
+                 // Conjugate Symmetry for Real Output
+                 for i in 1..half {
+                     self.scratch_out[FFT_SIZE - i] = self.scratch_out[i].conj();
+                 }
+
+                 // 4. Inverse FFT
+                 self.planner.plan_fft_inverse(FFT_SIZE).process(&mut self.scratch_out);
+
+                 // 5. Output Overlap-Add (Simplified: Window + Norm)
+                 // Just normalize by FFT_SIZE for now.
+                 // Ideally we'd window again, but let's stick to basic reconstruction.
+                 let norm = 1.0 / FFT_SIZE as f32;
+                 
+                 for i in 0..FFT_SIZE {
+                     self.out_buf.push_back(self.scratch_out[i].re * norm);
+                 }
+                 
+                 // Clear Input Buffer (Hop = Size)
+                 self.in_buf.clear(); 
+            }
+            
+            // Pop output
+            let wet_sig = self.out_buf.pop_front().unwrap_or(0.0);
+            let final_wet = (wet_sig * 2.0).tanh(); // Saturation / Limiter ("Not clippy")
+
+            // Send to visuals
+            if let Ok(mut vis) = self.visuals.try_lock() {
+                 if vis.input_history.len() >= 512 { vis.input_history.pop_front(); }
+                 vis.input_history.push_back(input_mono);
+
+                 if vis.output_history.len() >= 512 { vis.output_history.pop_front(); }
+                 vis.output_history.push_back(final_wet);
             }
 
-            // READ
-            let mut buf_l = *samples[0];
-            let mut buf_r = *samples[1];
+            // Mix
+            let output_sig = input_mono * (1.0 - mix) + final_wet * mix;
             
-            // --- REVERB ---
-            let mono_sum = (buf_l + buf_r) * 0.5;
-            let rev_sig = self.reverb.process(mono_sum, rev_size, 0.5);
-            
-            // Blend Reverb
-            buf_l = buf_l * (1.0 - rev_mix) + rev_sig * rev_mix;
-            buf_r = buf_r * (1.0 - rev_mix) + rev_sig * rev_mix;
-
-            // --- DELAY ---
-            let (d_l, d_r) = self.delay.process(buf_l, buf_r, del_time, del_feed);
-            buf_l = buf_l * (1.0 - del_mix) + d_l * del_mix;
-            buf_r = buf_r * (1.0 - del_mix) + d_r * del_mix;
-
-            // --- OTT (Simplified Multiband Slam) ---
-            let smash = |x: f32| -> f32 {
-                let driven = x * (1.0 + ott_drive * 10.0);
-                driven.tanh()
-            };
-            
-            let smashed_l = smash(buf_l);
-            let smashed_r = smash(buf_r);
-            
-            buf_l = buf_l * (1.0 - ott_depth) + smashed_l * ott_depth;
-            buf_r = buf_r * (1.0 - ott_depth) + smashed_r * ott_depth;
-
-            // WRITE
-            *samples[0] = buf_l * out_gain;
-            *samples[1] = buf_r * out_gain;
+            // Write to all channels
+            for sample in samples.iter_mut() {
+                **sample = output_sig * gain;
+            }
         }
 
         ProcessStatus::Normal
     }
 }
 
-impl Vst3Plugin for Whirlpool {
-    const VST3_CLASS_ID: [u8; 16] = *b"Whirlpool_______";
-    const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] =
-        &[Vst3SubCategory::Fx, Vst3SubCategory::Reverb, Vst3SubCategory::Delay];
-}
-
 impl ClapPlugin for Whirlpool {
     const CLAP_ID: &'static str = "com.antigravity.whirlpool";
-    const CLAP_DESCRIPTION: Option<&'static str> = Some("Whirlpool Reverb-Delay-Slam");
+    const CLAP_DESCRIPTION: Option<&'static str> = Some("Whirlpool Spectral Harmonizer");
     const CLAP_MANUAL_URL: Option<&'static str> = Some(Self::URL);
     const CLAP_SUPPORT_URL: Option<&'static str> = None;
     const CLAP_FEATURES: &'static [ClapFeature] = &[ClapFeature::AudioEffect, ClapFeature::Stereo];
+}
+
+impl Vst3Plugin for Whirlpool {
+    const VST3_CLASS_ID: [u8; 16] = *b"WhirlpoolSPECTRA";
+    const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] =
+        &[Vst3SubCategory::Fx, Vst3SubCategory::Instrument];
 }
 
 nih_export_clap!(Whirlpool);
