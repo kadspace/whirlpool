@@ -132,102 +132,89 @@ impl Plugin for Whirlpool {
                 ctx.set_style(style);
 
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    ui.label(egui::RichText::new("WHIRLPOOL SPECTRAL").heading().strong().color(egui::Color32::CYAN));
-                    ui.separator();
-                    
-                    // --- SPLIT VISUALIZER ---
-                    // Two panels side-by-side
-                    ui.columns(2, |cols| {
-                        if let Ok(vis) = visuals.try_lock() {
-                            // Panel 1: Input (Dry)
-                            cols[0].group(|ui| {
-                                ui.label("Input Signal");
-                                let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 80.0), egui::Sense::hover());
-                                ui.painter().rect_filled(rect, 3.0, egui::Color32::from_rgb(20, 20, 25));
-                                
-                                if vis.input_history.len() > 1 {
-                                    let points: Vec<egui::Pos2> = vis.input_history.iter().enumerate().map(|(i, &v)| {
-                                        let x = rect.min.x + (i as f32 / vis.input_history.len() as f32) * rect.width();
-                                        // Scale visualization a bit
-                                        let y = rect.center().y - v * 30.0; 
-                                        egui::pos2(x, y.clamp(rect.min.y, rect.max.y)) 
-                                    }).collect();
-                                    ui.painter().add(egui::Shape::line(points, egui::Stroke::new(1.0, egui::Color32::GRAY)));
-                                }
-                            });
-
-                            // Panel 2: Output (Wet/Harmonized)
-                            cols[1].group(|ui| {
-                                ui.label("Harmonized Output");
-                                let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 80.0), egui::Sense::hover());
-                                ui.painter().rect_filled(rect, 3.0, egui::Color32::from_rgb(20, 20, 25));
-
-                                if vis.output_history.len() > 1 {
-                                    let points: Vec<egui::Pos2> = vis.output_history.iter().enumerate().map(|(i, &v)| {
-                                        let x = rect.min.x + (i as f32 / vis.output_history.len() as f32) * rect.width();
-                                        let y = rect.center().y - v * 30.0;
-                                        egui::pos2(x, y.clamp(rect.min.y, rect.max.y))
-                                    }).collect();
-                                    ui.painter().add(egui::Shape::line(points, egui::Stroke::new(1.5, egui::Color32::CYAN)));
-                                }
-                            });
-                        }
-                    });
-                    
-                    ui.ctx().request_repaint(); // Animation
-
-                    ui.add_space(10.0);
-                    ui.separator();
-                    ui.add_space(10.0);
-
-                    // --- CONTROLS ---
-                    // Use a grid or just neat vertical stack
-                    ui.vertical_centered(|ui| {
-                        ui.label(egui::RichText::new("SPECTRAL ENGINE").strong());
-                        ui.add(widgets::ParamSlider::for_param(&params.harmonics, setter)); // Labels inside param?
-                        // No, ParamSlider usually doesn't show label by default in nih_plug_egui 0.9.1 unless we use .with_label() which failed?
-                        // Actually, I can put label above.
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        ui.label(egui::RichText::new("WHIRLPOOL SPECTRAL").heading().strong().color(egui::Color32::CYAN));
+                        ui.separator();
                         
-                        // Wait, previous iteration I used `ui.label("Name")` then `ui.add(slider)`.
-                        // That works. Let's stick to that but maybe wrap in horizontal for label + slider?
-                        // Or just centered stack.
-                        
-                        // Let's rely on standard layouts.
-                        
-                        let slider = |ui: &mut egui::Ui, label: &str, param: &FloatParam| {
-                            ui.horizontal(|ui| {
-                                ui.label(label);
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                     ui.add(widgets::ParamSlider::for_param(param, setter));
+                        // --- SPLIT VISUALIZER ---
+                        ui.columns(2, |cols| {
+                            if let Ok(vis) = visuals.try_lock() {
+                                // Panel 1: Input
+                                cols[0].group(|ui| {
+                                    ui.label("Input Signal");
+                                    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 80.0), egui::Sense::hover());
+                                    ui.painter().rect_filled(rect, 3.0, egui::Color32::from_rgb(20, 20, 25));
+                                    
+                                    if vis.input_history.len() > 1 {
+                                        let points: Vec<egui::Pos2> = vis.input_history.iter().enumerate().map(|(i, &v)| {
+                                            let x = rect.min.x + (i as f32 / vis.input_history.len() as f32) * rect.width();
+                                            let y = rect.center().y - v * 30.0; 
+                                            egui::pos2(x, y.clamp(rect.min.y, rect.max.y)) 
+                                        }).collect();
+                                        ui.painter().add(egui::Shape::line(points, egui::Stroke::new(1.0, egui::Color32::GRAY)));
+                                    }
                                 });
-                            });
-                        };
-                        
-                        // BUT, ParamSlider draws its own value text usually.
-                        // I will trust `widgets::ParamSlider` handles the interaction well, just needs space.
-                        // I'll put labels above for clarity.
-                        
-                        ui.label("Harmonics Amount");
-                        ui.add(widgets::ParamSlider::for_param(&params.harmonics, setter));
-                        
-                        ui.label("Shift Interval (Octaves)");
-                        ui.add(widgets::ParamSlider::for_param(&params.shift, setter));
-                        
-                        ui.label("Spectral Blur (Wash)");
-                        ui.add(widgets::ParamSlider::for_param(&params.blur, setter));
-                    });
 
-                    ui.add_space(10.0);
-                    ui.separator();
-                    ui.add_space(10.0);
-                    
-                    ui.vertical_centered(|ui| {
-                        ui.label(egui::RichText::new("MASTER").strong());
-                        ui.label("Dry / Wet Mix");
-                        ui.add(widgets::ParamSlider::for_param(&params.mix, setter));
+                                // Panel 2: Output
+                                cols[1].group(|ui| {
+                                    ui.label("Harmonized Output");
+                                    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 80.0), egui::Sense::hover());
+                                    ui.painter().rect_filled(rect, 3.0, egui::Color32::from_rgb(20, 20, 25));
+
+                                    if vis.output_history.len() > 1 {
+                                        let points: Vec<egui::Pos2> = vis.output_history.iter().enumerate().map(|(i, &v)| {
+                                            let x = rect.min.x + (i as f32 / vis.output_history.len() as f32) * rect.width();
+                                            let y = rect.center().y - v * 30.0;
+                                            egui::pos2(x, y.clamp(rect.min.y, rect.max.y))
+                                        }).collect();
+                                        ui.painter().add(egui::Shape::line(points, egui::Stroke::new(1.5, egui::Color32::CYAN)));
+                                    }
+                                });
+                            }
+                        });
                         
-                        ui.label("Output Volume");
-                        ui.add(widgets::ParamSlider::for_param(&params.out_gain, setter));
+                        ui.ctx().request_repaint(); 
+
+                        ui.add_space(20.0);
+                        ui.separator();
+                        ui.add_space(20.0);
+
+                        // --- CONTROLS (Grid Layout) ---
+                        ui.group(|ui| {
+                             ui.heading("Parameters");
+                             ui.add_space(10.0);
+                             
+                             egui::Grid::new("my_grid")
+                                 .num_columns(2)
+                                 .spacing([40.0, 20.0])
+                                 .striped(true)
+                                 .show(ui, |ui| {
+                                     // Row 1: Harmonics
+                                     ui.label("Harmonics");
+                                     ui.add(widgets::ParamSlider::for_param(&params.harmonics, setter));
+                                     ui.end_row();
+
+                                     // Row 2: Shift
+                                     ui.label("Shift");
+                                     ui.add(widgets::ParamSlider::for_param(&params.shift, setter));
+                                     ui.end_row();
+
+                                     // Row 3: Blur
+                                     ui.label("Blur");
+                                     ui.add(widgets::ParamSlider::for_param(&params.blur, setter));
+                                     ui.end_row();
+                                     
+                                     // Row 4: Mix
+                                     ui.label("Dry/Wet");
+                                     ui.add(widgets::ParamSlider::for_param(&params.mix, setter));
+                                     ui.end_row();
+
+                                     // Row 5: Gain
+                                     ui.label("Volume");
+                                     ui.add(widgets::ParamSlider::for_param(&params.out_gain, setter));
+                                     ui.end_row();
+                                 });
+                        });
                     });
                 });
             },
