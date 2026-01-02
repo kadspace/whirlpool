@@ -300,9 +300,9 @@ impl ClapPlugin for Whirlpool {
 }
 
 impl Vst3Plugin for Whirlpool {
-    const VST3_CLASS_ID: [u8; 16] = *b"WhirlpoolSPECTRA";
+    const VST3_CLASS_ID: [u8; 16] = *b"Whirlpool_______"; // Reverted to original ID
     const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] =
-        &[Vst3SubCategory::Fx, Vst3SubCategory::Instrument];
+        &[Vst3SubCategory::Fx, Vst3SubCategory::Modulation]; // Removed Instrument
 }
 
 nih_export_clap!(Whirlpool);
