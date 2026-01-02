@@ -1,13 +1,23 @@
 
 use nih_plug::prelude::*;
 use nih_plug_egui::{create_egui_editor, egui, EguiState, widgets};
-use std::sync::{Arc, Mutex};
 use rustfft::{FftPlanner, num_complex::Complex};
 use rustfft::num_traits::Zero;
+use std::sync::{Arc, Mutex};
 use std::collections::VecDeque;
+use std::f32::consts::PI;
 
 // --- DSP CONSTANTS ---
-const FFT_SIZE: usize = 1024; // ~23ms at 44.1k
+const FFT_SIZE: usize = 1024;
+const WINDOW_SIZE: usize = 1024;
+
+// Simple pseudo-random for phase blur in DSP thread
+// x: bin index, seed: rolling counter
+fn fast_rand(x: usize, seed: u32) -> f32 {
+    let mut n = (x as u32).wrapping_mul(374761393).wrapping_add(seed);
+    n = (n ^ (n >> 13)).wrapping_mul(1274126177);
+    (n as f32) / (u32::MAX as f32)
+}
 
 struct Visuals {
     input_history: VecDeque<f32>,
@@ -17,8 +27,8 @@ struct Visuals {
 impl Default for Visuals {
     fn default() -> Self {
         Self { 
-            input_history: VecDeque::from(vec![0.0; 512]),
-            output_history: VecDeque::from(vec![0.0; 512]),
+            input_history: VecDeque::from(vec![0.0; 256]), // Smaller for separate windows? 256 is fine
+            output_history: VecDeque::from(vec![0.0; 256]),
         }
     }
 }
@@ -29,11 +39,14 @@ struct Whirlpool {
     
     // DSP State
     planner: FftPlanner<f32>,
-    in_buf: Vec<f32>,   // Accumulate input
-    out_buf: VecDeque<f32>, // Latency buffer
+    in_buf: Vec<f32>,   
+    out_buf: VecDeque<f32>, 
     window: Vec<f32>,
     scratch_in: Vec<Complex<f32>>,
     scratch_out: Vec<Complex<f32>>,
+    
+    // Random seed for blur
+    seed: u32,
 }
 
 #[derive(Params)]
@@ -51,17 +64,19 @@ struct WhirlpoolParams {
 impl Default for Whirlpool {
     fn default() -> Self {
         let mut planner = FftPlanner::new();
-        let window = (0..FFT_SIZE).map(|i| 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / (FFT_SIZE as f32 - 1.0)).cos())).collect();
+        // Hann Window
+        let window = (0..WINDOW_SIZE).map(|i| 0.5 * (1.0 - (2.0 * PI * i as f32 / (WINDOW_SIZE as f32 - 1.0)).cos())).collect();
         
         Self {
             params: Arc::new(WhirlpoolParams::default()),
             visuals: Arc::new(Mutex::new(Visuals::default())),
             planner,
             in_buf: Vec::with_capacity(FFT_SIZE),
-            out_buf: VecDeque::from(vec![0.0; FFT_SIZE]), // Initial Latency
+            out_buf: VecDeque::from(vec![0.0; FFT_SIZE]),
             window,
             scratch_in: vec![Complex::zero(); FFT_SIZE],
             scratch_out: vec![Complex::zero(); FFT_SIZE],
+            seed: 0,
         }
     }
 }
@@ -69,13 +84,13 @@ impl Default for Whirlpool {
 impl Default for WhirlpoolParams {
     fn default() -> Self {
         Self {
-            editor_state: EguiState::from_size(500, 350),
+            editor_state: EguiState::from_size(600, 450), // Slightly larger default
 
             harmonics: FloatParam::new("Harmonics", 0.5, FloatRange::Linear { min: 0.0, max: 1.0 }),
-            shift: FloatParam::new("Shift (Oct)", 1.0, FloatRange::Linear { min: 0.5, max: 3.0 }),
-            blur: FloatParam::new("Blur", 0.2, FloatRange::Linear { min: 0.0, max: 1.0 }),
+            shift: FloatParam::new("Shift", 1.0, FloatRange::Linear { min: 0.5, max: 2.0 }), // Tuned range
+            blur: FloatParam::new("Blur", 0.0, FloatRange::Linear { min: 0.0, max: 1.0 }),
             mix: FloatParam::new("Dry/Wet", 0.8, FloatRange::Linear { min: 0.0, max: 1.0 }),
-            out_gain: FloatParam::new("Output", 1.0, FloatRange::Linear { min: 0.0, max: 2.0 }),
+            out_gain: FloatParam::new("Volume", 1.0, FloatRange::Linear { min: 0.0, max: 2.0 }),
         }
     }
 }
@@ -85,7 +100,7 @@ impl Plugin for Whirlpool {
     const VENDOR: &'static str = "Antigravity";
     const URL: &'static str = "https://example.com";
     const EMAIL: &'static str = "info@example.com";
-    const VERSION: &'static str = "2.0.0";
+    const VERSION: &'static str = "2.1.0"; // Version bump
 
     const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[
         AudioIOLayout {
@@ -110,55 +125,110 @@ impl Plugin for Whirlpool {
             (),
             |_, _| {},
             move |ctx: &egui::Context, setter: &ParamSetter, _state: &mut ()| {
+                // Style Polish
+                let mut style = (*ctx.style()).clone();
+                style.spacing.item_spacing = egui::vec2(10.0, 15.0); // More breathing room
+                style.spacing.slider_width = 300.0; // Wider sliders
+                ctx.set_style(style);
+
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    ui.heading("WHIRLPOOL SPECTRAL");
+                    ui.label(egui::RichText::new("WHIRLPOOL SPECTRAL").heading().strong().color(egui::Color32::CYAN));
                     ui.separator();
                     
-                    // --- WAVEFORM VISUALIZER ---
-                    // Draw a dark background
-                    let (rect, _resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 100.0), egui::Sense::hover());
-                    ui.painter().rect_filled(rect, 3.0, egui::Color32::from_rgb(10, 10, 15));
+                    // --- SPLIT VISUALIZER ---
+                    // Two panels side-by-side
+                    ui.columns(2, |cols| {
+                        if let Ok(vis) = visuals.try_lock() {
+                            // Panel 1: Input (Dry)
+                            cols[0].group(|ui| {
+                                ui.label("Input Signal");
+                                let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 80.0), egui::Sense::hover());
+                                ui.painter().rect_filled(rect, 3.0, egui::Color32::from_rgb(20, 20, 25));
+                                
+                                if vis.input_history.len() > 1 {
+                                    let points: Vec<egui::Pos2> = vis.input_history.iter().enumerate().map(|(i, &v)| {
+                                        let x = rect.min.x + (i as f32 / vis.input_history.len() as f32) * rect.width();
+                                        // Scale visualization a bit
+                                        let y = rect.center().y - v * 30.0; 
+                                        egui::pos2(x, y.clamp(rect.min.y, rect.max.y)) 
+                                    }).collect();
+                                    ui.painter().add(egui::Shape::line(points, egui::Stroke::new(1.0, egui::Color32::GRAY)));
+                                }
+                            });
 
-                    if let Ok(vis) = visuals.try_lock() {
-                        // Safe to read visuals here
-                        // Draw Input (Gray)
-                        if vis.input_history.len() > 1 {
-                             let points_in: Vec<egui::Pos2> = vis.input_history.iter().enumerate().map(|(i, &v)| {
-                                 let x = rect.min.x + (i as f32 / vis.input_history.len() as f32) * rect.width();
-                                 let y = rect.center().y - v * 40.0;
-                                 egui::pos2(x, y)
-                             }).collect();
-                             ui.painter().add(egui::Shape::line(points_in, egui::Stroke::new(1.0, egui::Color32::from_rgb(80, 80, 80))));
+                            // Panel 2: Output (Wet/Harmonized)
+                            cols[1].group(|ui| {
+                                ui.label("Harmonized Output");
+                                let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 80.0), egui::Sense::hover());
+                                ui.painter().rect_filled(rect, 3.0, egui::Color32::from_rgb(20, 20, 25));
+
+                                if vis.output_history.len() > 1 {
+                                    let points: Vec<egui::Pos2> = vis.output_history.iter().enumerate().map(|(i, &v)| {
+                                        let x = rect.min.x + (i as f32 / vis.output_history.len() as f32) * rect.width();
+                                        let y = rect.center().y - v * 30.0;
+                                        egui::pos2(x, y.clamp(rect.min.y, rect.max.y))
+                                    }).collect();
+                                    ui.painter().add(egui::Shape::line(points, egui::Stroke::new(1.5, egui::Color32::CYAN)));
+                                }
+                            });
                         }
+                    });
+                    
+                    ui.ctx().request_repaint(); // Animation
 
-                        // Draw Output (Cyan)
-                        if vis.output_history.len() > 1 {
-                            let points_out: Vec<egui::Pos2> = vis.output_history.iter().enumerate().map(|(i, &v)| {
-                                let x = rect.min.x + (i as f32 / vis.output_history.len() as f32) * rect.width();
-                                let y = rect.center().y - v * 40.0;
-                                egui::pos2(x, y)
-                            }).collect();
-                            ui.painter().add(egui::Shape::line(points_out, egui::Stroke::new(1.5, egui::Color32::from_rgb(0, 255, 255))));
-                        }
-                        
-                        // Request repaint for animation
-                        ui.ctx().request_repaint();
-                    }
-
+                    ui.add_space(10.0);
                     ui.separator();
+                    ui.add_space(10.0);
 
                     // --- CONTROLS ---
-                    ui.label("Harmonics");
-                    ui.add(widgets::ParamSlider::for_param(&params.harmonics, setter));
-                    ui.label("Shift");
-                    ui.add(widgets::ParamSlider::for_param(&params.shift, setter));
-                    ui.label("Blur");
-                    ui.add(widgets::ParamSlider::for_param(&params.blur, setter));
+                    // Use a grid or just neat vertical stack
+                    ui.vertical_centered(|ui| {
+                        ui.label(egui::RichText::new("SPECTRAL ENGINE").strong());
+                        ui.add(widgets::ParamSlider::for_param(&params.harmonics, setter)); // Labels inside param?
+                        // No, ParamSlider usually doesn't show label by default in nih_plug_egui 0.9.1 unless we use .with_label() which failed?
+                        // Actually, I can put label above.
+                        
+                        // Wait, previous iteration I used `ui.label("Name")` then `ui.add(slider)`.
+                        // That works. Let's stick to that but maybe wrap in horizontal for label + slider?
+                        // Or just centered stack.
+                        
+                        // Let's rely on standard layouts.
+                        
+                        let slider = |ui: &mut egui::Ui, label: &str, param: &FloatParam| {
+                            ui.horizontal(|ui| {
+                                ui.label(label);
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                     ui.add(widgets::ParamSlider::for_param(param, setter));
+                                });
+                            });
+                        };
+                        
+                        // BUT, ParamSlider draws its own value text usually.
+                        // I will trust `widgets::ParamSlider` handles the interaction well, just needs space.
+                        // I'll put labels above for clarity.
+                        
+                        ui.label("Harmonics Amount");
+                        ui.add(widgets::ParamSlider::for_param(&params.harmonics, setter));
+                        
+                        ui.label("Shift Interval (Octaves)");
+                        ui.add(widgets::ParamSlider::for_param(&params.shift, setter));
+                        
+                        ui.label("Spectral Blur (Wash)");
+                        ui.add(widgets::ParamSlider::for_param(&params.blur, setter));
+                    });
+
+                    ui.add_space(10.0);
                     ui.separator();
-                    ui.label("Dry/Wet");
-                    ui.add(widgets::ParamSlider::for_param(&params.mix, setter));
-                    ui.label("Volume");
-                    ui.add(widgets::ParamSlider::for_param(&params.out_gain, setter));
+                    ui.add_space(10.0);
+                    
+                    ui.vertical_centered(|ui| {
+                        ui.label(egui::RichText::new("MASTER").strong());
+                        ui.label("Dry / Wet Mix");
+                        ui.add(widgets::ParamSlider::for_param(&params.mix, setter));
+                        
+                        ui.label("Output Volume");
+                        ui.add(widgets::ParamSlider::for_param(&params.out_gain, setter));
+                    });
                 });
             },
         )
@@ -176,112 +246,93 @@ impl Plugin for Whirlpool {
         let mix = self.params.mix.value();
         let gain = self.params.out_gain.value();
 
-        // Mono processing buffer loop
+        // Update seed once per block or keep rolling
+        self.seed = self.seed.wrapping_add(1);
+
         for channel_samples in buffer.iter_samples() {
-            // Collect samples to avoid double-borrow issue
             let mut samples: Vec<&mut f32> = channel_samples.into_iter().collect();
             if samples.is_empty() { continue; }
 
-            // Calculate Mono Input
+            // Mono Input
             let mut input_mono = 0.0;
             for s in samples.iter() { input_mono += **s; }
             input_mono /= samples.len() as f32;
 
-            // STFT Buffering
             self.in_buf.push(input_mono);
 
-            // Output sample (Latency compensation: pop from out_buf)
-            // If out_buf is empty (underrun or initial), return 0
-            // But we pre-filled it in Default.
-            // If push rate > pop rate? No, 1:1 ratio.
-            
-            // PROCESS FRAME if enough input
             if self.in_buf.len() >= FFT_SIZE {
-                 // 1. Prepare FFT (Copy windowed input to scratch)
+                 // 1. Window + Prepare
                  for i in 0..FFT_SIZE {
                      self.scratch_in[i] = Complex::new(self.in_buf[i] * self.window[i], 0.0);
                  }
                  
-                 // 2. Forward FFT
+                 // 2. FFT
                  self.planner.plan_fft_forward(FFT_SIZE).process(&mut self.scratch_in);
 
                  // 3. Spectral Processing
-                 // Zero out output scratch
                  for x in self.scratch_out.iter_mut() { *x = Complex::zero(); }
-                 
                  let half = FFT_SIZE / 2;
-                 
+
                  for i in 0..half {
                      let bin = self.scratch_in[i];
-                     if bin.norm_sqr() < 1e-6 { continue; } // Noise floor
+                     if bin.norm_sqr() < 1e-6 { continue; } // Gate
 
-                     // Fundamental (Mix with Harmonics later via 'mix' param is Dry/Wet?)
-                     // Actually 'harmonics' param adds harmonics. Fundamental is always there?
-                     // Let's say Harmonics param controls the ADDED harmonics level.
+                     // Base
                      self.scratch_out[i] += bin;
 
-                     // Generate Harmonics
+                     // Harmonics
                      if harmonics > 0.01 {
-                         // Shift logic
-                         // e.g. Shift 1.0 = Octave (+100% freq -> 2x freq)
-                         // e.g. Shift 0.5 = Fifth (+50% -> 1.5x)
-                         let target_idx = (i as f32 * (1.0 + shift)).round() as usize; 
-                         
-                         if target_idx < half {
+                         let target = (i as f32 * (1.0 + shift)).round() as usize; // e.g. 100hz -> 200hz (Octave UP) if Shift=1.0
+                         if target < half {
                              let mag = bin.norm();
                              let phase = bin.arg();
                              
-                             // Blur phase
-                             let new_phase = if blur > 0.0 { 
-                                 // Random phase or linear phase shift? Random is nicer for "wash"
-                                 // But we don't have rand here easily (unless we add valid Rng).
-                                 // Deterministic blur: phase + i * blur
-                                 phase + (i as f32 * blur * 0.1)
+                             // BLUR LOGIC: RANDOMIZED PHASE
+                             // If blur > 0, we scramble phase. 
+                             // Magnitude is preserved (so tone is there), but phase coherency is lost = Diffuse/Reverb sound.
+                             let new_phase = if blur > 0.0 {
+                                 let r = fast_rand(target + self.seed as usize, self.seed);
+                                 // Blend between original phase and random phase based on blur amount
+                                 // Linear interpolation of angle is tricky, but let's just add random noise
+                                 phase + (r * 2.0 * PI * blur) 
                              } else { phase };
                              
-                             self.scratch_out[target_idx] += Complex::from_polar(mag * harmonics, new_phase);
+                             self.scratch_out[target] += Complex::from_polar(mag * harmonics, new_phase);
                          }
                      }
                  }
                  
-                 // Conjugate Symmetry for Real Output
+                 // Symmetry
                  for i in 1..half {
                      self.scratch_out[FFT_SIZE - i] = self.scratch_out[i].conj();
                  }
 
-                 // 4. Inverse FFT
+                 // 4. IFFT
                  self.planner.plan_fft_inverse(FFT_SIZE).process(&mut self.scratch_out);
 
-                 // 5. Output Overlap-Add (Simplified: Window + Norm)
-                 // Just normalize by FFT_SIZE for now.
-                 // Ideally we'd window again, but let's stick to basic reconstruction.
+                 // 5. Output
                  let norm = 1.0 / FFT_SIZE as f32;
-                 
                  for i in 0..FFT_SIZE {
                      self.out_buf.push_back(self.scratch_out[i].re * norm);
                  }
-                 
-                 // Clear Input Buffer (Hop = Size)
                  self.in_buf.clear(); 
             }
             
-            // Pop output
+            // Output
             let wet_sig = self.out_buf.pop_front().unwrap_or(0.0);
-            let final_wet = (wet_sig * 2.0).tanh(); // Saturation / Limiter ("Not clippy")
+            let final_wet = (wet_sig * 2.0).tanh(); 
 
-            // Send to visuals
+            // Visuals
             if let Ok(mut vis) = self.visuals.try_lock() {
-                 if vis.input_history.len() >= 512 { vis.input_history.pop_front(); }
+                 if vis.input_history.len() >= 256 { vis.input_history.pop_front(); }
                  vis.input_history.push_back(input_mono);
 
-                 if vis.output_history.len() >= 512 { vis.output_history.pop_front(); }
+                 if vis.output_history.len() >= 256 { vis.output_history.pop_front(); }
                  vis.output_history.push_back(final_wet);
             }
 
-            // Mix
             let output_sig = input_mono * (1.0 - mix) + final_wet * mix;
             
-            // Write to all channels
             for sample in samples.iter_mut() {
                 **sample = output_sig * gain;
             }
@@ -300,9 +351,9 @@ impl ClapPlugin for Whirlpool {
 }
 
 impl Vst3Plugin for Whirlpool {
-    const VST3_CLASS_ID: [u8; 16] = *b"Whirlpool_______"; // Reverted to original ID
+    const VST3_CLASS_ID: [u8; 16] = *b"Whirlpool_______"; 
     const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] =
-        &[Vst3SubCategory::Fx, Vst3SubCategory::Modulation]; // Removed Instrument
+        &[Vst3SubCategory::Fx, Vst3SubCategory::Modulation];
 }
 
 nih_export_clap!(Whirlpool);
