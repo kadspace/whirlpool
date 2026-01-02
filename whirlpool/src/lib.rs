@@ -81,7 +81,7 @@ impl Default for Whirlpool {
 impl Default for WhirlpoolParams {
     fn default() -> Self {
         Self {
-            editor_state: EguiState::from_size(800, 500),
+            editor_state: EguiState::from_size(800, 600), // Increased height to prevent cutoff
 
             harmonics: FloatParam::new("Harmonics", 0.5, FloatRange::Linear { min: 0.0, max: 1.0 }),
             shift: FloatParam::new("Shift", 1.0, FloatRange::Linear { min: 0.5, max: 2.0 }),
@@ -98,7 +98,7 @@ fn knob(ui: &mut egui::Ui, value: &mut f32, range: std::ops::RangeInclusive<f32>
     let (rect, mut response) = ui.allocate_exact_size(desired_size, egui::Sense::drag());
 
     if response.dragged() {
-        let delta = response.drag_delta().y * -0.01; // Drag up to increase
+        let delta = response.drag_delta().y * -0.0025; // Slower, tighter feel
         *value = (*value + delta).clamp(*range.start(), *range.end());
         response.mark_changed();
     }
@@ -293,14 +293,7 @@ impl Plugin for Whirlpool {
                         });
                     }
 
-                    // Settings Button (Bottom Right)
-                    ui.with_layout(egui::Layout::bottom_up(egui::Align::Max), |ui| {
-                        if !state.show_settings {
-                            if ui.button("⚙ Settings").clicked() {
-                                state.show_settings = true;
-                            }
-                        }
-                    });
+
 
                     ui.ctx().request_repaint();
                 });
