@@ -39,5 +39,5 @@ if %ERRORLEVEL% neq 0 (
      exit /b 1
 )
 
-echo Done! Module is in hellovstGUI/target/bundled/
+echo Done! Module is in whirlpool\target\bundled\Whirlpool.vst3
 endlocal
